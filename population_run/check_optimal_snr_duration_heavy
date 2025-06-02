@@ -1,0 +1,538 @@
+#!/usr/bin/env python
+
+import os, argparse
+import subprocess
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+from pycbc.waveform.spa_tmplt import findchirp_chirptime
+from pycbc.pnutils import get_final_freq
+from pycbc.waveform import get_fd_det_waveform, get_td_waveform
+from pycbc.psd.analytical_space import analytical_psd_lisa_tdi_AE_confusion, analytical_psd_lisa_tdi_T
+from pycbc.coordinates import TIME_OFFSET_20_DEGREES
+from pycbc.filter.matchedfilter import sigma
+from pycbc.psd import from_txt
+from pycbc.detector import Detector
+from pycbc.conversions import mchirp_from_mass1_mass2, q_from_mass1_mass2, chi_eff, chi_a
+from bbhx.utils.constants import YRSID_SI
+import h5py
+from tqdm import tqdm
+
+
+# command line parser
+parser = argparse.ArgumentParser()
+parser.add_argument("--seed")
+parser.add_argument("--dir-path")
+parser.add_argument("--injection-file-name")
+parser.add_argument("--t-lisa-obs-cases")
+parser.add_argument("--t-3g-wait-cases")
+
+# parser command line
+opts = parser.parse_args()
+
+seed = opts.seed
+DIR_PATH = opts.dir_path
+FILE_NAME = opts.injection_file_name
+t_lisa_obs_cases = [np.float64(num) for num in opts.t_lisa_obs_cases.split()]
+t_3g_wait_cases = [np.float64(num) for num in opts.t_3g_wait_cases.split()]
+
+def check_folder_path(folder_path):
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"Folder '{folder_path}' created.")
+    else:
+        pass
+
+def ht_generator(det='ET', model='IMRPhenomD', params=None, rotation=False):
+
+    if params['mass1'] > 7 and params['mass2'] > 7:
+        # Generate a waveform at the detector-frame.
+        hp, hc = get_td_waveform(approximant=model, 
+                    mass1=params['mass1'], mass2=params['mass2'],
+                    spin1z=params['spin1z'], spin2z=params['spin2z'],
+                    distance=params['distance'], coa_phase=params['coa_phase'],
+                    inclination=params['inclination'], f_lower=params['f_lower'],
+                    f_ref=params['f_ref'], delta_t=params['delta_t'])
+    else:
+        # Generate a waveform at the detector-frame.
+        hp, hc = get_td_waveform(approximant=model, 
+                    mass1=params['mass1'], mass2=params['mass2'],
+                    spin1z=params['spin1z'], spin2z=params['spin2z'],
+                    distance=params['distance'], coa_phase=params['coa_phase'],
+                    inclination=params['inclination'], f_lower=params['f_lower'], f_final=2048,
+                    f_ref=params['f_ref'], delta_t=params['delta_t'])
+
+    # Set merger time to 'tc'.
+    hp.start_time += params['tc']
+    hc.start_time += params['tc']
+
+    # Project GW waveform onto GW detectors.
+    ra = params['ra']
+    dec = params['dec']
+    psi = params['polarization']
+
+    if det == 'ET':
+        det_1 = Detector("E1")
+        det_2 = Detector("E2")
+        det_3 = Detector("E3")
+        num_detectors = 3
+    elif det == 'CE':
+        det_1 = Detector("X4")
+        det_2 = Detector("X2")
+        num_detectors = 2
+    else:
+        raise NotImplementedError("No such detector.")
+
+    fp_1, fc_1 = det_1.antenna_pattern(
+                    right_ascension=ra, declination=dec, polarization=psi, t_gps=params['tc'])
+    fp_2, fc_2 = det_2.antenna_pattern(
+                    right_ascension=ra, declination=dec, polarization=psi, t_gps=params['tc'])
+    if num_detectors == 3:
+        fp_3, fc_3 = det_3.antenna_pattern(
+                        right_ascension=ra, declination=dec, polarization=psi, t_gps=params['tc'])
+
+    if rotation == True:
+        # Take the rotation of the earth into account by using the "project_wave" function.
+        ht_1 = det_1.project_wave(hp=hp, hc=hc, ra=ra, dec=dec, polarization=psi)
+        ht_2 = det_2.project_wave(hp=hp, hc=hc, ra=ra, dec=dec, polarization=psi)
+        ht_list = [ht_1, ht_2]
+        if num_detectors == 3:
+            ht_3 = det_3.project_wave(hp=hp, hc=hc, ra=ra, dec=dec, polarization=psi)
+            ht_list.append(ht_3)
+    else:
+        # Not take the rotation of the earth into account.
+        ht_1 = fp_1*hp + fc_1*hc
+        ht_2 = fp_2*hp + fc_2*hc
+        ht_list = [ht_1, ht_2]
+        if num_detectors == 3:
+            ht_3 = fp_3*hp + fc_3*hc
+            ht_list.append(ht_3)
+
+    return ht_list
+
+def optimal_snr_lisa(params):
+    # Simply set it according to Tobs_LISA, not the duration of signal.
+    delta_f = params['delta_f']
+    fs = 2 * params['f_final']
+    flen = int(fs/delta_f)//2 + 1
+    flow = params['f_lower']
+    tdi = params['tdi']
+    if isinstance(params['t_offset'], str):
+        params['t_offset'] = TIME_OFFSET_20_DEGREES
+
+    bbhx_fd = get_fd_det_waveform(ifos=['LISA_A','LISA_E','LISA_T'], **params)
+    strain_list = list(bbhx_fd.keys())
+
+    psd_tdi_A_E = analytical_psd_lisa_tdi_AE_confusion(flen, delta_f, flow,
+                        len_arm=2.5e9, acc_noise_level=2.4e-15, oms_noise_level=7.9e-12,
+                        duration=1/delta_f/YRSID_SI, tdi=tdi)
+    psd_tdi_T = analytical_psd_lisa_tdi_T(flen, delta_f, flow, 
+                        len_arm=2.5e9, acc_noise_level=2.4e-15, oms_noise_level=7.9e-12,
+                        tdi=tdi)
+    psd_list = [psd_tdi_A_E, psd_tdi_A_E, psd_tdi_T]
+
+    snr_opt = 0
+    for i in range(3):
+        snr_opt += sigma(htilde=bbhx_fd[strain_list[i]], psd=psd_list[i],
+                         low_frequency_cutoff=flow, high_frequency_cutoff=fs/2)**2
+
+    return np.sqrt(snr_opt)
+
+def optimal_snr_ce(params):
+    strain_td = ht_generator(det='CE', model='IMRPhenomD', params=params, rotation=False)
+    delta_f = 1. / int(strain_td[0].duration)
+    fs = params['fs']
+    flen = int(fs/delta_f)//2 + 1
+    flow = params['f_lower'] + 0.5
+    ce_40km_asd_path = DIR_PATH + "/ground_det_asd/ce_strain/cosmic_explorer_strain.txt"
+    ce_40km_psd = from_txt(ce_40km_asd_path, length=flen, delta_f=delta_f, low_freq_cutoff=flow, is_asd_file=True)
+    ce_20km_asd_path = DIR_PATH + "/ground_det_asd/ce_strain/cosmic_explorer_20km_strain.txt"
+    ce_20km_psd = from_txt(ce_20km_asd_path, length=flen, delta_f=delta_f, low_freq_cutoff=flow, is_asd_file=True)
+    psd_list = [ce_40km_psd, ce_20km_psd]
+
+    snrs_opt = []
+    for i in range(len(psd_list)):
+        snrs_opt.append(sigma(htilde=strain_td[i].to_frequencyseries(delta_f), psd=psd_list[i],
+                        low_frequency_cutoff=flow, high_frequency_cutoff=fs/2))
+
+    return snrs_opt
+
+def optimal_snr_et(params):
+    strain_td = ht_generator(det='ET', model='IMRPhenomD', params=params, rotation=False)
+    delta_f = 1. / int(strain_td[0].duration)
+    fs = params['fs']
+    flen = int(fs/delta_f)//2 + 1
+    flow = params['f_lower']
+    et_asd_path = DIR_PATH + "/ground_det_asd/ET_D_asd.txt"
+    et_psd = from_txt(et_asd_path, length=flen, delta_f=delta_f, low_freq_cutoff=flow, is_asd_file=True)
+    psd_list = [et_psd, et_psd, et_psd]
+
+    snrs_opt = []
+    for i in range(len(psd_list)):
+        snrs_opt.append(sigma(htilde=strain_td[i].to_frequencyseries(delta_f), psd=psd_list[i],
+                        low_frequency_cutoff=flow, high_frequency_cutoff=fs/2))
+
+    return snrs_opt
+
+def imr_duration(**params):
+    from pycbc.waveform.waveform import imrphenomd_length_in_time
+    nparams = {'mass1':params['mass1'], 'mass2':params['mass2'],
+               'spin1z':params['spin1z'], 'spin2z':params['spin2z'],
+               'f_lower':params['f_lower']}
+    time_length = np.float64(imrphenomd_length_in_time(**nparams))
+    return time_length * 1.1
+
+def interpolated_tf(m1, m2):
+    # Using findchirp_chirptime in PyCBC to calculate 
+    # the time-frequency track of dominant mode.
+    freq_array = np.logspace(-4, -1, num=100)
+    t_array = np.zeros(len(freq_array))
+    for i in range(len(freq_array)):
+        # t measured from tc
+        t_array[i] = findchirp_chirptime(m1=m1, m2=m2, fLower=freq_array[i], porder=7)
+    tf_track = interp1d(t_array, freq_array)
+    return tf_track
+
+def get_lisa_fstart_fend(**params):
+    tf_track = interpolated_tf(params['mass1'], params['mass2'])
+    if params['t_obs_start'] < tf_track.x[0]:
+        # tf_track.x[0] is the time at 0.1 Hz to the merger
+        # f_start above LISA upper f-cutoff
+        f_start = "ABOVE_OF_LISA_BAND"
+    else:
+        f_start = np.float64(tf_track(params['t_obs_start']))
+    t_obs_lisa = params['t_lisa_obs_end'] - params['t_lisa_obs_start']
+    if params['t_obs_start'] >= t_obs_lisa:
+        # we need set f_end to be the f when t_lisa_obs_end
+        if params['t_obs_start'] - t_obs_lisa >= tf_track.x[0]:
+            f_end = np.float64(tf_track(params['t_obs_start'] - t_obs_lisa))
+        else:
+            f_end = 1e-1
+    else:
+        # if merge within LISA time window, set f_end to be f_merger or 0.1 Hz
+        f_end = get_final_freq(approx="IMRPhenomD", m1=params['mass1'], m2=params['mass2'],
+                               s1z=params['spin1z'], s2z=params['spin2z'])
+        if f_end > 1e-1:
+            f_end = 1e-1
+    return (f_start, f_end)
+
+def horizon_check_snr_3(total_srcmass, lisa_duration):
+    if np.abs(lisa_duration - 1) < 1e-2:
+        a, b = 1.3599003330454806, -0.2311543387164552
+        c, d = 2.163795409362838, -1.465274411068177
+        n = 35.05739616636385
+    elif np.abs(lisa_duration - 2) < 1e-2:
+        a, b = 1.366300447236548, -0.15260809796985828
+        c, d = 2.088937543849617, -1.1191117859138289
+        n = 19.970166275959237
+    elif np.abs(lisa_duration - 3) < 1e-2:
+        a, b = 1.3824986013327347, -0.11359353822681899
+        c, d = 2.031612677268789, -0.9104297197386295
+        n = 17.029913520094738
+    elif np.abs(lisa_duration - 3.75) < 1e-2:
+        a, b = 1.4487402882671567, -0.15624457084919507
+        c, d = 2.008053231604586, -0.8105211337510392
+        n = 14.992603370956209
+    elif np.abs(lisa_duration - 4.5) < 1e-2:
+        a, b = 1.553847857926775, -0.23855250136251516
+        c, d = 1.9874227478052542, -0.7280912060576983
+        n = 14.992603370956209
+    elif np.abs(lisa_duration - 7.5) < 1e-2:
+        a, b = 1.9879935169228917, -0.583743699101215
+        c, d = 1.9013161884956955, -0.4556951986398923
+        n = 17.958450227813547
+    else:
+        print("Please check LISA mission duration.")
+    def fit_func(x, n):
+        if x < n:
+            return np.power(10, b) * np.power(x, a)
+        else:
+            return np.power(10, d) * np.power(x, c)
+
+    return fit_func(total_srcmass, n)
+
+LISA_SNR_THRESHOLD = 3
+signal_id = []
+snr_list_lisa = []
+t_obs_start_lisa = []
+lisa_obs_duration = []
+f_start_lisa = []
+f_end_lisa = []
+snr_list_ce = []
+snr_list_et = []
+t_ce = []
+t_et = []
+f = h5py.File(DIR_PATH + "/population_run/%s.hdf" % FILE_NAME, 'r')
+
+def calculate_opt_snrs_and_create_inject(i, output_lists, t_lisa_obs, t_3g_wait, single_inj_path):
+    f = h5py.File(DIR_PATH + "/population_run/%s.hdf" % FILE_NAME, 'r')
+    static_params = dict(f.attrs).copy()
+
+    signal_id = output_lists[0]
+    snr_list_lisa = output_lists[1]
+    t_obs_start_lisa = output_lists[2]
+    lisa_obs_duration = output_lists[3]
+    f_start_lisa = output_lists[4]
+    f_end_lisa = output_lists[5]
+    snr_list_ce = output_lists[6]
+    snr_list_et = output_lists[7]
+    t_ce = output_lists[8]
+    t_et = output_lists[9]
+
+    # set parameters for LISA
+    params_lisa = {}
+    params_lisa['tdi'] = static_params['tdi']
+    params_lisa['ref_frame'] = static_params['ref_frame']
+    params_lisa['approximant'] = static_params['approximant']
+    params_lisa['mass1'] = f['mass1'][i]
+    params_lisa['mass2'] = f['mass2'][i]
+    params_lisa['mchirp'] = mchirp_from_mass1_mass2(params_lisa['mass1'], params_lisa['mass2'])
+    params_lisa['q'] = q_from_mass1_mass2(params_lisa['mass1'], params_lisa['mass2'])
+    params_lisa['srcmass1'] = f['srcmass1'][i]
+    params_lisa['srcmass2'] = f['srcmass2'][i]
+    params_lisa['spin1z'] = f['spin1z'][i]
+    params_lisa['spin2z'] = f['spin2z'][i]
+    params_lisa['chi_eff'] = chi_eff(params_lisa['mass1'], params_lisa['mass2'], params_lisa['spin1z'], params_lisa['spin2z'])
+    params_lisa['chi_a'] = chi_a(params_lisa['mass1'], params_lisa['mass2'], params_lisa['spin1z'], params_lisa['spin2z'])
+    params_lisa['distance'] = f['distance'][i]
+    params_lisa['inclination'] = f['inclination'][i]
+    params_lisa['coa_phase'] = f['coa_phase'][i]
+    params_lisa['f_ref'] = static_params['f_ref']
+    params_lisa['t_offset'] = static_params['t_offset']
+    params_lisa['fs'] = static_params['fs']
+    params_lisa['taper'] = static_params['taper']
+    params_lisa['tc_geo'] = f['tc_geo'][i]
+    params_lisa['tc'] = f['tc'][i]
+    params_lisa['eclipticlongitude'] = f['eclipticlongitude'][i]
+    params_lisa['eclipticlatitude'] = f['eclipticlatitude'][i]
+    params_lisa['polarization'] = np.mod(f['polarization'][i], np.pi)
+
+    # Calculate for each signal.
+    static_params['t_lisa_obs_end'] = static_params['t_lisa_obs_start'] + t_lisa_obs * YRSID_SI
+    t_3g_wait_end = static_params['t_lisa_obs_end'] + t_3g_wait * YRSID_SI
+    params_lisa['t_obs_start'] = params_lisa['tc_geo'] - static_params['t_lisa_obs_start']
+    params_lisa['delta_f'] = 1. / (static_params['t_lisa_obs_end'] - static_params['t_lisa_obs_start'])
+    params_lisa['t_lisa_obs_start'] = static_params['t_lisa_obs_start']
+    params_lisa['t_lisa_obs_end'] = static_params['t_lisa_obs_end']
+    params_lisa['f_lower'], params_lisa['f_final'] = get_lisa_fstart_fend(**params_lisa)
+
+    if horizon_check_snr_3(2*np.max([params_lisa['srcmass1'], params_lisa['srcmass2']]), t_lisa_obs) >= params_lisa['distance'] and \
+        params_lisa['f_lower'] != "ABOVE_OF_LISA_BAND" and \
+        params_lisa['tc_geo'] <= t_3g_wait_end:
+        # Only the signal passes the rough SNR check (based on a precalculated horizon distance),
+        # within LISA frequency band and time 3G time window, will do an optimal SNR check.
+        snr = optimal_snr_lisa(params_lisa)
+
+        if snr >= LISA_SNR_THRESHOLD:
+            signal_id.append(i)
+            snr_list_lisa.append(snr)
+            t_obs_start_lisa.append(params_lisa['t_obs_start'])
+            lisa_obs_duration.append(t_lisa_obs * YRSID_SI)
+            f_start_lisa.append(params_lisa['f_lower'])
+            f_end_lisa.append(params_lisa['f_final'])
+            # set parameters for 3G
+            params_ce = {}
+            params_ce['mass1'] = f['mass1'][i]
+            params_ce['mass2'] = f['mass2'][i]
+            params_ce['spin1z'] = f['spin1z'][i]
+            params_ce['spin2z'] = f['spin2z'][i]
+            params_ce['distance'] = f['distance'][i]
+            params_ce['inclination'] = f['inclination'][i]
+            params_ce['coa_phase'] = f['coa_phase_geo'][i]
+            params_ce['f_lower'] = 5
+            params_ce['f_ref'] = static_params['f_ref']
+            params_ce['f_final'] = 2048
+            params_ce['fs'] = params_ce['f_final'] * 2
+            params_ce['delta_t'] = 1. / params_ce['fs']
+            params_ce['taper'] = static_params['taper']
+
+            params_ce['tc'] = f['tc_geo'][i]
+            params_ce['ra'] = f['ra'][i]
+            params_ce['dec'] = f['dec'][i]
+            params_ce['polarization'] = np.mod(f['polarization_geo'][i], np.pi)
+            snr_list_ce.append(optimal_snr_ce(params_ce))
+            t_ce.append(imr_duration(**params_ce))
+
+            params_et = params_ce.copy()
+            params_et['f_lower'] = 2
+            snr_list_et.append(optimal_snr_et(params_et))
+            t_et.append(imr_duration(**params_et))
+
+            # create injection for each signal above LISA and 3G threshold
+            # LISA
+            path_inj_lisa = single_inj_path + "/inj_%s_lisa.ini" % i
+            f = open(path_inj_lisa, 'w')
+            f.write("""
+[variable_params]
+
+[static_params]
+mass1 = %s
+mass2 = %s
+mchirp = %s
+q = %s
+spin1z = %s
+spin2z = %s
+chi_eff = %s
+chi_a = %s
+distance = %s
+inclination = %s
+coa_phase = %s
+tc_geo_ref = %s
+tc = %s
+eclipticlongitude = %s
+eclipticlatitude = %s
+polarization = %s
+
+tdi = %s
+ref_frame = SSB
+approximant = BBHX_PhenomD
+fs = 0.2
+f_ref = 5
+taper = start
+f_lower = %s
+f_final = %s
+t_obs_start = %s
+t_offset = TIME_OFFSET_20_DEGREES
+            """ % (
+                params_lisa['mass1'], params_lisa['mass2'],
+                params_lisa['mchirp'], params_lisa['q'],
+                params_lisa['spin1z'], params_lisa['spin2z'],
+                params_lisa['chi_eff'], params_lisa['chi_a'],
+                params_lisa['distance'], params_lisa['inclination'],
+                params_lisa['coa_phase'], params_ce['tc'], params_lisa['tc'],
+                params_lisa['eclipticlongitude'], params_lisa['eclipticlatitude'],
+                params_lisa['polarization'], params_lisa['tdi'], params_lisa['f_lower'],
+                params_lisa['f_final'], params_lisa['t_obs_start']
+            ))
+            f.close()
+
+            command_inj_lisa = "pycbc_create_injections --verbose " \
+                               "--config-files {} " \
+                               "--ninjections 1 " \
+                               "--seed 10 " \
+                               "--output-file {} " \
+                               "--variable-params-section variable_params " \
+                               "--static-params-section static_params " \
+                               "--force".format(path_inj_lisa,
+                                    single_inj_path + "/inj_%s_lisa.hdf" % i)
+            try:
+                subprocess.run(command_inj_lisa, shell=True, check=True)
+                print("Injection for LISA command executed successfully.")
+            except subprocess.CalledProcessError as e:
+                print(f"Error: {e}")
+
+            # 3G
+            path_inj_3g = single_inj_path + "/inj_%s_3g.ini" % i
+            f = open(path_inj_3g, 'w')
+            f.write("""
+[variable_params]
+
+[static_params]
+mass1 = %s
+mass2 = %s
+mchirp = %s
+q = %s
+spin1z = %s
+spin2z = %s
+chi_eff = %s
+chi_a = %s
+distance = %s
+inclination = %s
+coa_phase = %s
+tc_geo_ref = %s
+tc = %s
+ra = %s
+dec = %s
+polarization = %s
+
+approximant = IMRPhenomD
+detector_projection_method = constant
+fs = 4096
+f_ref = 5
+taper = start
+f_lower = %s
+            """ % (
+                params_ce['mass1'], params_ce['mass2'],
+                params_lisa['mchirp'], params_lisa['q'],
+                params_ce['spin1z'], params_ce['spin2z'],
+                params_lisa['chi_eff'], params_lisa['chi_a'],
+                params_ce['distance'], params_ce['inclination'],
+                params_ce['coa_phase'], params_ce['tc'], params_ce['tc'],
+                params_ce['ra'], params_ce['dec'],
+                params_ce['polarization'], params_et['f_lower']
+            ))
+            f.close()
+
+            command_inj_3g = "pycbc_create_injections --verbose " \
+                             "--config-files {} " \
+                             "--ninjections 1 " \
+                             "--seed 10 " \
+                             "--output-file {} " \
+                             "--variable-params-section variable_params " \
+                             "--static-params-section static_params " \
+                             "--force".format(path_inj_3g,
+                                single_inj_path + "/inj_%s_3g.hdf" % i)
+            try:
+                subprocess.run(command_inj_3g, shell=True, check=True)
+                print("Injection for 3G command executed successfully.")
+            except subprocess.CalledProcessError as e:
+                print(f"Error: {e}")
+
+            return None
+
+
+# loop over all the observation scenarios
+for lisa_obs, xg_wait in zip(t_lisa_obs_cases, t_3g_wait_cases):
+    if not os.path.exists(DIR_PATH + "/population_run/snr_seed_%s_obs_%syrs_wait_%syrs.csv" % (seed, lisa_obs, xg_wait)):
+        single_inj_outputs_path = DIR_PATH + "/population_run/multiverse_seed_%s/injection_above_snr_threshold_seed_%s_obs_%syrs_wait_%syrs" % (seed, seed, lisa_obs, xg_wait)
+        check_folder_path(single_inj_outputs_path)
+
+        signal_id = []
+        snr_list_lisa = []
+        t_obs_start_lisa = []
+        lisa_obs_duration = []
+        f_start_lisa = []
+        f_end_lisa = []
+        snr_list_ce = []
+        snr_list_et = []
+        t_ce = []
+        t_et = []
+
+        for i in tqdm(range(len(f['mass1']))):
+            if f['srcmass1'][i] + f['srcmass2'][i] >= 100:
+                output_lists = [signal_id, snr_list_lisa, t_obs_start_lisa, lisa_obs_duration, f_start_lisa, f_end_lisa, snr_list_ce, snr_list_et, t_ce, t_et]
+                calculate_opt_snrs_and_create_inject(
+                    i, output_lists,
+                    t_lisa_obs=lisa_obs, t_3g_wait=xg_wait,
+                    single_inj_path=single_inj_outputs_path)
+
+        snr_ce_total = []
+        snr_et_total = []
+        snr_3g = []
+        for i in range(len(snr_list_lisa)):
+            snr_ce_total.append(np.sqrt(snr_list_ce[i][0]**2 + snr_list_ce[i][1]**2))
+            snr_et_total.append(np.sqrt(snr_list_et[i][0]**2 + snr_list_et[i][1]**2 + snr_list_et[i][2]**2))
+            snr_3g.append(np.sqrt(snr_ce_total[-1]**2 + snr_et_total[-1]**2))
+
+        # Save data
+        data = {
+            "index": signal_id,
+            "snr_lisa": snr_list_lisa,
+            "snr_ce_40": [snr[0] for snr in snr_list_ce],
+            "snr_ce_20": [snr[1] for snr in snr_list_ce],
+            "snr_ce_total": snr_ce_total,
+            "snr_et_e1": [snr[0] for snr in snr_list_et],
+            "snr_et_e2": [snr[1] for snr in snr_list_et],
+            "snr_et_e3": [snr[2] for snr in snr_list_et],
+            "snr_et_total": snr_et_total,
+            "snr_3g": snr_3g,
+            "t_obs_start_lisa": t_obs_start_lisa,
+            "lisa_obs_duration": lisa_obs_duration,
+            "f_start_lisa": f_start_lisa,
+            "f_end_lisa": f_end_lisa,
+            "duration_ce": t_ce,
+            "duration_et": t_et
+        }
+
+        df = pd.DataFrame(data)
+        df.to_csv(DIR_PATH + "/population_run/snr_seed_%s_obs_%syrs_wait_%syrs.csv" % (seed, lisa_obs, xg_wait), index=False)

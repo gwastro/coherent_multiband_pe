@@ -1,0 +1,227 @@
+#!/usr/bin/env python
+
+import h5py
+import numpy as np
+import pandas as pd
+import os, argparse
+import pycbc.workflow as wf
+import pycbc
+import pycbc.workflow.pegasus_workflow as wdax
+from pycbc.conversions import chi_eff, chi_a
+from bbhx.utils.constants import MTSUN_SI
+import configparser
+
+
+def to_file(path, ifo=None):
+    """ Takes a str and returns a pycbc.workflow.pegasus_workflow.File
+    instance.
+    """
+    fil = wdax.File(os.path.basename(path))
+    fil.ifo = ifo
+    path = os.path.abspath(path)
+    fil.add_pfn(path, "local")
+    return fil
+
+# command line parser
+parser = argparse.ArgumentParser()
+parser.add_argument("--population-draw-file")
+parser.add_argument("--injection-file-folder")
+parser.add_argument("--injection-snr-duration-file")
+parser.add_argument("--lisa-obs-duration")
+parser.add_argument("--inference-config")
+pycbc.init_logging(True)
+
+# add option groups
+wf.add_workflow_command_line_group(parser)
+wf.add_workflow_settings_cli(parser)
+
+# parser command line
+opts = parser.parse_args()
+
+f = h5py.File(opts.population_draw_file, 'r')
+static_params = f.attrs
+inj_folder_path = os.path.abspath(opts.injection_file_folder)
+inj_snr_duration_path = os.path.abspath(opts.injection_snr_duration_file)
+
+inj_coa_phase = f['coa_phase'][:]
+inj_coa_phase_geo = f['coa_phase'][:]
+inj_dec = f['dec'][:]
+inj_distance = f['distance'][:]
+inj_eclipticlatitude = f['eclipticlatitude'][:]
+inj_eclipticlongitude = f['eclipticlongitude'][:]
+inj_inclination = f['inclination'][:]
+inj_mass1 = f['mass1'][:]
+inj_mass2 = f['mass2'][:]
+inj_polarization = f['polarization'][:]
+inj_polarization_geo = f['polarization_geo'][:]
+inj_q = f['q'][:]
+inj_ra = f['ra'][:]
+inj_redshift = f['redshift'][:]
+inj_spin1z = f['spin1z'][:]
+inj_spin2z = f['spin2z'][:]
+inj_tc = f['tc'][:]
+inj_tc_geo = f['tc_geo'][:]
+
+
+cp = configparser.ConfigParser()
+cp.read(opts.inference_config)
+workflow = wf.Workflow(opts, "lisa_kde")
+
+wf.makedir(opts.output_dir)
+
+# construct Executable for running sampler
+inference_exe = wf.Executable(workflow.cp, "inference", ifos=workflow.ifos,
+                              out_dir=opts.output_dir)
+
+if workflow.cp.has_section('plot'):
+    plot_exe = wf.Executable(workflow.cp, "plot", ifos=workflow.ifos,
+                             out_dir=opts.output_dir)
+
+infhand = to_file(opts.inference_config)
+
+# loop over number of loudest events to be analyzed
+nsnrs = pd.read_csv(inj_snr_duration_path)
+
+for num_event in nsnrs['index']:
+    inj_path_lisa = inj_folder_path + "/inj_%s_lisa.hdf" % num_event
+    inj_path_3g = inj_folder_path + "/inj_%s_3g.hdf" % num_event
+    nessai_output_path_lisa = os.path.abspath(opts.output_dir) + "/nessai_output_inj_%s_lisa_kde" % num_event
+    output_dir_3g = opts.output_dir.replace('lisa_kde', '3g')
+    posterior_3g_path = os.path.abspath(output_dir_3g) + "/local-site-scratch/work" + "/X4-MODELSTATS_3G_REC_%s-0-0.hdf" % num_event
+    index_in_results_file = np.where(nsnrs['index']==num_event)[0][0]
+    f_start_lisa = nsnrs['f_start_lisa'][index_in_results_file]
+    f_end_lisa = nsnrs['f_end_lisa'][index_in_results_file]
+    mass1 = inj_mass1[num_event]
+    mass2 = inj_mass2[num_event]
+    mf_start_lisa = 0.99 * f_start_lisa * MTSUN_SI * (mass1+mass2)
+    spin1z = inj_spin1z[num_event]
+    spin2z = inj_spin2z[num_event]
+    spin_eff = chi_eff(mass1, mass2, spin1z, spin2z)
+    spin_a = chi_a(mass1, mass2, spin1z, spin2z)
+    tc = inj_tc[num_event]
+    eclipticlongitude = inj_eclipticlongitude[num_event]
+    eclipticlatitude = inj_eclipticlatitude[num_event]
+    polarization = inj_polarization[num_event]
+    tc_geo = inj_tc_geo[num_event]
+    ra = inj_ra[num_event]
+    dec = inj_dec[num_event]
+    polarization_geo = inj_polarization_geo[num_event]
+    snr_3g = nsnrs['snr_3g'][index_in_results_file]
+    tc_lisa, _, _, _ = pycbc.coordinates.ssb_to_lisa(
+        t_ssb=tc,
+        longitude_ssb=eclipticlongitude,
+        latitude_ssb=eclipticlatitude,
+        polarization_ssb=polarization
+    )
+    t_obs_start_lisa = int(nsnrs['t_obs_start_lisa'][index_in_results_file])
+    # In the unit of years.
+    t_obs_lisa = np.float64(opts.lisa_obs_duration)
+    # In the unit of seconds.
+    duration_ce = int(nsnrs['duration_ce'][index_in_results_file] + 0.5)
+    duration_et = int(nsnrs['duration_et'][index_in_results_file] + 0.5)
+    mchirp = pycbc.conversions.mchirp_from_mass1_mass2(mass1, mass2)
+    # In PyCBC, q >= 1, but in GWTC-3 population results, q <= 1.
+    q = pycbc.conversions.q_from_mass1_mass2(mass1, mass2)
+    dl = inj_distance[num_event]
+
+    # make individual trig ini files
+    path = opts.output_dir + '/specific_prior_inj_%s_lisa_kde.ini' % num_event
+    fhand = to_file(path)
+
+    # make node for running sampler
+    node = inference_exe.create_node()
+    node.add_input_list_opt("--config-file", [infhand, fhand])
+    inference_file = node.new_output_file_opt(workflow.analysis_time, ".hdf",
+                                              "--output-file",
+                                              tags=['lisa_kde', str(num_event)])
+    start_file = inference_file.lfn
+    workflow += node
+
+    if workflow.cp.has_section('plot'):
+        # plot the inference output
+        node = plot_exe.create_node()
+        node.add_input_opt("--input-file", inference_file)
+        plot_file = node.new_output_file_opt(workflow.analysis_time, ".png",
+                                             "--output-file",
+                                             tags=['lisa_kde', str(num_event)])
+        workflow += node
+
+    f = open(path, 'w')
+    f.write("""
+[specific]
+injection-file-lisa = %s
+injection-file-3g = %s
+nessai_output = '%s'
+
+f_start_lisa = %s
+f_end_lisa = %s
+mf_start_lisa = %s
+mass1 = %s
+mass2 = %s
+spin1z = %s
+spin2z = %s
+tc = %s
+eclipticlongitude = %s
+eclipticlatitude = %s
+polarization = %s
+tc_geo = %s
+ra = %s
+dec = %s
+polarization_geo = %s
+snr_3g_min = %s
+snr_3g_max = %s
+tc_lisa = %s
+t_obs_start_lisa = %s
+t_obs_lisa = %s
+duration_ce = %s
+duration_et = %s
+
+mchirp_min = %s
+mchirp_max = %s
+q_min = %s
+q_max = %s
+chi_eff_min = %s
+chi_eff_max = %s
+chi_a_min = %s
+chi_a_max = %s
+tc_geo_min = %s
+tc_geo_max = %s
+dl_min = %s
+dl_max = %s
+ra_min = %s
+ra_max = %s
+dec_min = %s
+dec_max = %s
+
+; segment with the length of 1 week and half a week overlap in Welch PSD estimation
+psd_inverse_length = %s
+psd_segment_length = %s
+psd_segment_stride = %s
+
+start-file = %s
+posterior_3g_path = %s
+""" % (inj_path_lisa, inj_path_3g, nessai_output_path_lisa,
+       f_start_lisa, f_end_lisa, mf_start_lisa,
+       mass1, mass2, spin1z, spin2z,
+       tc, eclipticlongitude, eclipticlatitude, polarization,
+       tc_geo, ra, dec, polarization_geo,
+       snr_3g - 200 if snr_3g >=200.2 else 0.2, snr_3g + 200,
+       tc_lisa, t_obs_start_lisa, t_obs_lisa,
+       duration_ce, duration_et,
+       mchirp - 0.1, mchirp + 0.1,
+       q - 0.2 if q >= 1.2 else 1, q + 0.2,
+       spin_eff - 0.2 if spin_eff - 0.2 >= -1 else -1, spin_eff + 0.2 if spin_eff + 0.2 <= 1 else 1,
+       -1, 1,
+       tc_geo - 0.0002, tc_geo + 0.0002,
+       dl - 100 if dl >= 100.001 else 0.001, dl + 100,
+       ra - 0.015, ra + 0.015,
+       dec - 0.015, dec + 0.015,
+       604800,
+       604800,
+       302400,
+       start_file,
+       posterior_3g_path))
+    f.close()
+
+# write dax
+workflow.save('lisa_kde.dax')
